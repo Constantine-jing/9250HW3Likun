@@ -1,0 +1,605 @@
+---
+title: "Homework 3 – Problem 2: Neural Bayes Estimators"
+author: "Team Members: [Names Here]"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+set.seed(2026)
+```
+
+# Background
+
+We consider the exponentially tilted distribution with density:
+
+$$
+f(x;\theta) = \sqrt{\frac{1}{4\pi}} \cdot \frac{\exp\!\left(-\frac{1}{4x} - \theta x\right)}{x^{3/2}\,\exp\!\left(-\sqrt{\theta}\right)}, \quad x > 0,\; \theta \ge 0.
+$$
+
+The log-density is:
+
+$$
+\log f(x;\theta) = -\tfrac{1}{2}\log(4\pi) - \tfrac{3}{2}\log x - \frac{1}{4x} - \theta x + \sqrt{\theta}.
+$$
+
+This is an inverse-Gaussian family: for $\theta > 0$,
+$X \sim \text{IG}\!\bigl(\mu = \frac{1}{2\sqrt\theta},\; \lambda = \frac{1}{2}\bigr)$.
+When $\theta = 0$ it reduces to a Lévy distribution.
+
+Each test dataset has $k = 50$ i.i.d. draws under a common $\theta$.
+
+## Load test data
+
+```{r load-data}
+load("test_data.RData")
+# Adjust object name if needed:
+# Z_test <- test_data
+cat("Number of test datasets:", length(Z_test), "\n")
+cat("Size of first dataset:", length(Z_test[[1]]), "\n")
+head(Z_test[[1]])
+```
+
+# Part 1 – Maximum Likelihood Estimation (30 pts)
+
+## Log-likelihood derivation
+
+For $\mathbf{x} = (x_1,\dots,x_k)$:
+
+$$
+\ell(\theta) = C(\mathbf{x}) - \theta \sum_i x_i + k\sqrt{\theta},
+$$
+
+where $C$ does not depend on $\theta$. Setting $\ell'(\theta) = 0$:
+
+$$
+\hat\theta_{\text{MLE}} = \left(\frac{k}{2\sum_i x_i}\right)^2
+= \frac{1}{(2\bar{x})^2}.
+$$
+
+The second derivative $\ell''(\theta) = -k/(4\theta^{3/2}) < 0$ confirms a maximum.
+
+## Implementation
+
+```{r mle}
+mle_theta <- function(x) {
+  xbar <- mean(x)
+  (1 / (2 * xbar))^2
+}
+
+theta_mle <- sapply(Z_test, mle_theta)
+
+cat("Summary of MLE estimates:\n")
+summary(theta_mle)
+```
+
+```{r mle-hist, fig.width=7, fig.height=4}
+hist(theta_mle, breaks = 50, col = "steelblue", border = "white",
+     main = "MLE estimates across 1000 test datasets",
+     xlab = expression(hat(theta)[MLE]))
+```
+
+# Part 2 – Neural Bayes Estimation (45 pts)
+
+## Strategy for minimising weighted MSE
+
+The evaluation metric is:
+$$
+\text{wMSE} = \frac{1}{1000}\sum_{i=1}^{1000} \frac{(\hat\theta_i - \theta_i)^2}{\theta_i + 0.001}.
+$$
+At $\theta = 0$ the weight is **1000**; at $\theta = 2$ the weight is **0.5**.
+Errors near the boundary dominate the score. Our strategy:
+
+1. **Boundary-heavy training prior** — 20% exact $\theta = 0$, 50% from
+   Exp(5) concentrated tightly near 0, 30% uniform for coverage.
+2. **Enriched per-observation features** — feed $[x_i,\; 1/x_i,\; \log x_i]$
+   instead of just $x_i$. The MLE depends on $1/\bar x$, so giving the network
+   direct access to reciprocals helps it learn the sufficient statistic.
+3. **Expert summary statistics** — pass MLE $\hat\theta$, $\min(x)$,
+   $\text{median}(x)$, and $\text{sd}(\log x)$ as set-level features
+   concatenated into the outer network $\phi$. These are highly informative
+   for $\theta$ and give the network a strong starting point.
+4. **Custom weighted loss** — define a Julia loss that weights squared
+   errors by $1/(\theta + 0.001)$, matching the evaluation metric exactly.
+5. **Ensemble** — train 3 estimators with different random seeds and
+   average their predictions to reduce variance.
+6. **Post-processing** — clamp final estimates to $[0, \infty)$.
+
+## Setup
+
+```{r nbe-setup}
+library(NeuralEstimators)
+# Sys.setenv(JULIA_BINDIR = "/path/to/Julia/bin")
+library(JuliaConnectoR)
+
+juliaEval('using NeuralEstimators, Flux')
+```
+
+## Simulator
+
+```{r nbe-simulator}
+# Inverse-Gaussian sampler (Michael/Schucany/Haas method)
+rinvgauss_one <- function(mu, lambda) {
+  nu <- rnorm(1)
+  y  <- nu^2
+  x  <- mu + (mu^2 * y) / (2 * lambda) -
+    (mu / (2 * lambda)) * sqrt(4 * mu * lambda * y + mu^2 * y^2)
+  if (runif(1) <= mu / (mu + x)) x else mu^2 / x
+}
+
+your_sampler <- function(theta) {
+  if (theta < 1e-12) {
+    z <- rnorm(1)
+    return(1 / (4 * z^2))
+  } else {
+    return(rinvgauss_one(1 / (2 * sqrt(theta)), 0.5))
+  }
+}
+```
+
+## Boundary-heavy training prior
+
+```{r nbe-sampler}
+theta_sampler <- function(K) {
+  theta <- numeric(K)
+  for (i in 1:K) {
+    u <- runif(1)
+    if (u < 0.20) {
+      theta[i] <- 0                        # 20% exact zeros
+    } else if (u < 0.70) {
+      theta[i] <- rexp(1, rate = 5)        # 50% Exp(5), mean=0.2
+    } else {
+      theta[i] <- runif(1, 0, 2.5)         # 30% uniform coverage
+    }
+  }
+  matrix(theta, nrow = 1, ncol = K)
+}
+```
+
+## Enriched features: $[x_i,\; 1/x_i,\; \log x_i]$
+
+Instead of feeding raw $x_i$ (dimension $d=1$), we transform each
+observation into a 3-dimensional feature vector. This lets the inner
+network $\psi$ immediately see the reciprocal (which drives the MLE)
+and the log-scale (which stabilises heavy-tailed inputs from $\theta \approx 0$).
+
+```{r nbe-simulate-enriched}
+simulate_enriched <- function(Theta, m) {
+  apply(
+    Theta, 2,
+    function(theta) {
+      x <- replicate(m, your_sampler(theta[1]))
+      # Stack enriched features: 3 x m matrix
+      rbind(x, 1/x, log(x))
+    },
+    simplify = FALSE
+  )
+}
+```
+
+## Expert summary statistics
+
+We pass set-level summary statistics into the outer network $\phi$.
+These are concatenated with the learned neural summary $T(Z)$.
+
+The NeuralEstimators package supports this via the `S` argument in
+`DeepSet(psi, phi, S)` where `S` is a Julia function.
+
+```{r nbe-expert-stats}
+# R function to compute expert summaries for each dataset
+# Returns a vector of expert stats for a single dataset
+compute_expert_stats <- function(x_enriched) {
+  # x_enriched is a 3 x m matrix: row1 = x, row2 = 1/x, row3 = log(x)
+  x <- x_enriched[1, ]
+
+  mle      <- (1 / (2 * mean(x)))^2        # MLE of theta
+  min_x    <- min(x)                        # minimum observation
+  med_x    <- median(x)                     # median
+  sd_logx  <- sd(log(x))                    # SD of log(x)
+  inv_mean <- mean(1/x)                     # mean of 1/x
+  q10      <- quantile(x, 0.10, names = FALSE)  # 10th percentile
+
+  c(mle, min_x, med_x, sd_logx, inv_mean, q10)
+}
+
+# Define expert stats function in Julia that calls R
+# NeuralEstimators expects S to take a single data matrix and return a vector
+expert_stats_julia <- juliaEval('
+  function expert_stats(Z)
+    # Z is a d x m matrix (3 x 50 after enrichment)
+    x = Z[1, :]  # raw observations in first row
+
+    n    = length(x)
+    xbar = sum(x) / n
+    mle  = (1 / (2 * xbar))^2
+
+    min_x    = minimum(x)
+    med_x    = sort(x)[div(n, 2)]
+    log_x    = log.(x)
+    sd_logx  = sqrt(sum((log_x .- sum(log_x)/n).^2) / (n - 1))
+    inv_mean = sum(1 ./ x) / n
+    q10      = sort(x)[max(1, round(Int, 0.10 * n))]
+
+    Float32[mle, min_x, med_x, sd_logx, inv_mean, q10]
+  end
+')
+```
+
+## Custom weighted loss in Julia
+
+We define a loss that directly matches the evaluation metric:
+$L(\hat\theta, \theta) = \frac{(\hat\theta - \theta)^2}{\theta + 0.001}$.
+
+```{r nbe-custom-loss}
+weighted_loss <- juliaEval('
+  function weighted_mse(theta_hat, theta)
+    # theta_hat and theta are p x K matrices (1 x K here)
+    delta = 0.001f0
+    w = 1.0f0 ./ (theta .+ delta)
+    mean(w .* (theta_hat .- theta).^2)
+  end
+')
+```
+
+## Neural network architecture with expert stats
+
+```{r nbe-architecture}
+d_enriched <- 3   # per-observation features: [x, 1/x, log(x)]
+d_expert   <- 6   # expert summary statistics
+
+estimator <- juliaEval(sprintf('
+  d  = %d    # enriched observation dimension
+  dS = %d    # expert summary stat dimension
+  p  = 1     # one parameter: theta
+  w  = 128   # hidden layer width
+
+  final_layer = Dense(w, p, softplus)   # enforce theta >= 0
+
+  psi = Chain(
+    Dense(d, w, relu),
+    Dense(w, w, relu),
+    Dense(w, w, relu)
+  )
+
+  # phi receives: w (neural summary) + dS (expert stats) = w + dS inputs
+  phi = Chain(
+    Dense(w + dS, w, relu),
+    Dense(w, w, relu),
+    Dense(w, w, relu),
+    final_layer
+  )
+
+  deepset = DeepSet(psi, phi, expert_stats)
+  estimator = PointEstimator(deepset)
+', d_enriched, d_expert))
+```
+
+## Training data
+
+```{r nbe-data}
+K <- 20000     # large training set for best performance
+m <- 50
+
+theta_train <- theta_sampler(K)
+theta_val   <- theta_sampler(K / 5)
+
+Z_train <- simulate_enriched(theta_train, m)
+Z_val   <- simulate_enriched(theta_val, m)
+
+cat("Training: K =", ncol(theta_train), ", m =", m, "\n")
+cat("Validation: K =", ncol(theta_val), "\n")
+```
+
+## Train with custom weighted loss
+
+```{r nbe-train}
+estimator <- train(
+  estimator,
+  theta_train = theta_train,
+  theta_val   = theta_val,
+  Z_train     = Z_train,
+  Z_val       = Z_val,
+  loss        = weighted_loss,
+  epochs      = 200,
+  batchsize   = 64
+)
+```
+
+## Assess on simulated data
+
+```{r nbe-assess, fig.width=7, fig.height=5}
+theta_sim_test <- theta_sampler(1000)
+Z_sim_test     <- simulate_enriched(theta_sim_test, m)
+
+assessment <- assess(
+  estimator,
+  theta_sim_test,
+  Z_sim_test,
+  estimator_names = "NBE",
+  parameter_names = "theta"
+)
+
+cat("Simulated test MSE:",
+    mean((assessment$estimates$estimate - assessment$estimates$truth)^2), "\n")
+
+# Weighted MSE
+est <- assessment$estimates$estimate
+tru <- assessment$estimates$truth
+wmse_sim <- mean((est - tru)^2 / (tru + 0.001))
+cat("Simulated weighted MSE:", wmse_sim, "\n")
+
+plotestimates(
+  assessment,
+  parameter_labels = c("theta1" = expression(theta))
+)
+```
+
+## Ensemble: train multiple estimators
+
+We train 3 estimators with different random seeds and training data
+realizations, then average their predictions.
+
+```{r nbe-ensemble}
+n_ensemble <- 3
+estimators <- list()
+
+for (e in 1:n_ensemble) {
+  cat("\n=== Training ensemble member", e, "of", n_ensemble, "===\n")
+
+  # Fresh training data each time (simulation on-the-fly effect)
+  set.seed(2026 + e * 100)
+  th_tr <- theta_sampler(K)
+  th_va <- theta_sampler(K / 5)
+  Z_tr  <- simulate_enriched(th_tr, m)
+  Z_va  <- simulate_enriched(th_va, m)
+
+  # Fresh network
+  est_e <- juliaEval(sprintf('
+    d  = %d
+    dS = %d
+    p  = 1
+    w  = 128
+
+    psi = Chain(Dense(d, w, relu), Dense(w, w, relu), Dense(w, w, relu))
+    phi = Chain(Dense(w + dS, w, relu), Dense(w, w, relu),
+                Dense(w, w, relu), Dense(w, p, softplus))
+
+    deepset = DeepSet(psi, phi, expert_stats)
+    PointEstimator(deepset)
+  ', d_enriched, d_expert))
+
+  est_e <- train(
+    est_e,
+    theta_train = th_tr,
+    theta_val   = th_va,
+    Z_train     = Z_tr,
+    Z_val       = Z_va,
+    loss        = weighted_loss,
+    epochs      = 200,
+    batchsize   = 64
+  )
+
+  estimators[[e]] <- est_e
+}
+```
+
+## Apply ensemble to test data
+
+```{r nbe-test}
+# Enrich test data
+Z_test_enriched <- lapply(Z_test, function(x) {
+  rbind(as.numeric(x), 1/as.numeric(x), log(as.numeric(x)))
+})
+
+# Collect predictions from each ensemble member
+preds <- matrix(NA, nrow = n_ensemble, ncol = length(Z_test))
+for (e in 1:n_ensemble) {
+  preds[e, ] <- as.numeric(estimate(estimators[[e]], Z_test_enriched))
+}
+
+# Ensemble average
+theta_nbe <- colMeans(preds)
+
+# Post-processing: clamp to [0, Inf)
+theta_nbe <- pmax(theta_nbe, 0)
+
+cat("Summary of ensemble NBE estimates:\n")
+summary(theta_nbe)
+
+# Individual ensemble member agreement
+cat("\nPer-member correlation matrix:\n")
+print(cor(t(preds)))
+```
+
+```{r nbe-hist, fig.width=7, fig.height=4}
+hist(theta_nbe, breaks = 50, col = "coral", border = "white",
+     main = "Ensemble NBE estimates across 1000 test datasets",
+     xlab = expression(hat(theta)[NBE]))
+```
+
+## Fallback: single estimator (if ensemble is too slow)
+
+If you don't want to run the ensemble, use the single estimator from
+the first training block:
+
+```{r nbe-single-fallback, eval=FALSE}
+Z_test_enriched <- lapply(Z_test, function(x) {
+  rbind(as.numeric(x), 1/as.numeric(x), log(as.numeric(x)))
+})
+theta_nbe <- as.numeric(estimate(estimator, Z_test_enriched))
+theta_nbe <- pmax(theta_nbe, 0)
+```
+
+# Part 3 – MCMC (10 bonus points)
+
+We use a Metropolis–Hastings sampler with log-scale random walk proposal
+and an $\text{Exponential}(3)$ prior.
+
+## Log-posterior
+
+```{r mcmc-logpost}
+log_likelihood <- function(theta, x) {
+  k <- length(x)
+  if (theta < 0) return(-Inf)
+  C <- -k/2 * log(4 * pi) - 1.5 * sum(log(x)) - 0.25 * sum(1/x)
+  C - theta * sum(x) + k * sqrt(max(theta, 0))
+}
+
+log_prior <- function(theta) {
+  if (theta < 0) return(-Inf)
+  log(3) - 3 * theta          # Exponential(rate=3)
+}
+
+log_posterior <- function(theta, x) {
+  log_likelihood(theta, x) + log_prior(theta)
+}
+```
+
+## Metropolis–Hastings sampler
+
+```{r mcmc-sampler}
+mcmc_sample <- function(x, n_iter = 20000, burn = 5000,
+                         theta_init = NULL, sigma_prop = 0.5) {
+  if (is.null(theta_init)) {
+    theta_init <- max(mle_theta(x), 1e-6)
+  }
+
+  chain <- numeric(n_iter)
+  chain[1] <- theta_init
+  accept <- 0
+
+  for (t in 2:n_iter) {
+    theta_cur <- chain[t - 1]
+    log_theta_star <- log(theta_cur) + rnorm(1, 0, sigma_prop)
+    theta_star <- exp(log_theta_star)
+
+    log_alpha <- log_posterior(theta_star, x) - log_posterior(theta_cur, x) +
+      log(theta_star) - log(theta_cur)
+
+    if (log(runif(1)) < log_alpha) {
+      chain[t] <- theta_star
+      accept <- accept + 1
+    } else {
+      chain[t] <- theta_cur
+    }
+  }
+
+  list(chain = chain, accept_rate = accept / (n_iter - 1), burn = burn)
+}
+```
+
+## Convergence diagnostics for test dataset 1
+
+```{r mcmc-diagnostics, fig.width=8, fig.height=8}
+res1 <- mcmc_sample(Z_test[[1]], n_iter = 30000, burn = 5000, sigma_prop = 0.3)
+cat("Acceptance rate:", round(res1$accept_rate, 3), "\n")
+
+chain_post <- res1$chain[(res1$burn + 1):length(res1$chain)]
+
+par(mfrow = c(2, 2))
+plot(chain_post, type = "l", col = "grey40",
+     main = "Trace plot (post burn-in)",
+     xlab = "Iteration", ylab = expression(theta))
+abline(h = mean(chain_post), col = "red", lwd = 2)
+
+hist(chain_post, breaks = 50, col = "steelblue", border = "white",
+     main = "Posterior of θ", xlab = expression(theta), probability = TRUE)
+abline(v = mean(chain_post), col = "red", lwd = 2)
+abline(v = quantile(chain_post, c(0.025, 0.975)), col = "blue", lty = 2)
+
+acf(chain_post, lag.max = 100, main = "Autocorrelation")
+
+running_mean <- cumsum(chain_post) / seq_along(chain_post)
+plot(running_mean, type = "l", col = "steelblue",
+     main = "Running mean", xlab = "Iteration", ylab = expression(bar(theta)))
+par(mfrow = c(1, 1))
+
+cat("\nPosterior summary for test dataset 1:\n")
+cat("  Mean:  ", round(mean(chain_post), 5), "\n")
+cat("  Median:", round(median(chain_post), 5), "\n")
+cat("  95% CI: [", round(quantile(chain_post, 0.025), 5), ",",
+    round(quantile(chain_post, 0.975), 5), "]\n")
+cat("  ESS:   ", round(coda::effectiveSize(chain_post), 1), "\n")
+```
+
+## Run MCMC on all 1000 datasets
+
+```{r mcmc-all}
+theta_mcmc <- numeric(length(Z_test))
+
+for (i in seq_along(Z_test)) {
+  res <- mcmc_sample(Z_test[[i]], n_iter = 20000, burn = 5000, sigma_prop = 0.3)
+  chain_post_i <- res$chain[(res$burn + 1):length(res$chain)]
+  theta_mcmc[i] <- mean(chain_post_i)
+  if (i %% 100 == 0) cat("Done", i, "of", length(Z_test), "\n")
+}
+
+cat("Summary of MCMC posterior means:\n")
+summary(theta_mcmc)
+```
+
+# Uncertainty Comparison (Bonus)
+
+## NBE uncertainty via bootstrap
+
+```{r nbe-bootstrap}
+# Use the first ensemble member for bootstrap
+theta_hat_1 <- estimate(estimators[[1]], Z_test_enriched[1])
+boot_mat    <- bootstrap(estimators[[1]], Z_test_enriched[1], B = 1000)
+
+cat("NBE point estimate:", as.numeric(theta_hat_1), "\n")
+cat("Bootstrap 95% CI: [", quantile(boot_mat[1,], 0.025), ",",
+    quantile(boot_mat[1,], 0.975), "]\n")
+cat("Bootstrap SD:", sd(boot_mat[1,]), "\n")
+
+hist(boot_mat[1,], breaks = 30, col = "coral", border = "white",
+     main = "NBE Bootstrap (Dataset 1)", xlab = expression(hat(theta)))
+abline(v = as.numeric(theta_hat_1), col = "red", lwd = 2)
+```
+
+## Side-by-side comparison
+
+```{r comparison}
+cat("\n=== Uncertainty for Test Dataset 1 ===\n\n")
+cat("MCMC posterior mean: ", round(mean(chain_post), 5), "\n")
+cat("MCMC 95% CI:         [", round(quantile(chain_post, 0.025), 5), ",",
+    round(quantile(chain_post, 0.975), 5), "]\n\n")
+cat("NBE point estimate:  ", round(as.numeric(theta_hat_1), 5), "\n")
+cat("NBE 95% bootstrap CI:[", round(quantile(boot_mat[1,], 0.025), 5), ",",
+    round(quantile(boot_mat[1,], 0.975), 5), "]\n")
+```
+
+# Evaluation
+
+```{r evaluation}
+# theta_true should come with test_data.RData — adjust name as needed
+# theta_true <- ...
+
+wmse <- function(theta_hat, theta_true, delta = 0.001) {
+  w <- 1 / (theta_true + delta)
+  mean(w * (theta_hat - theta_true)^2)
+}
+
+# Uncomment once you have theta_true:
+# cat("Weighted MSE — MLE:          ", wmse(theta_mle, theta_true), "\n")
+# cat("Weighted MSE — NBE (ensemble):", wmse(theta_nbe, theta_true), "\n")
+# cat("Weighted MSE — MCMC:         ", wmse(theta_mcmc, theta_true), "\n")
+```
+
+# Save estimates for submission
+
+```{r save}
+results <- data.frame(
+  dataset = 1:1000,
+  MLE     = theta_mle,
+  NBE     = theta_nbe,
+  MCMC    = theta_mcmc
+)
+write.csv(results, "HW3_P2_estimates.csv", row.names = FALSE)
+save(theta_mle, theta_nbe, theta_mcmc, file = "HW3_P2_estimates.RData")
+```

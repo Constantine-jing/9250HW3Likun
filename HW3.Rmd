@@ -1,0 +1,682 @@
+---
+title: "Homework 3 – Problem 2: Neural Bayes Estimators"
+author: "Team Members: [Names Here]"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+set.seed(2026)
+```
+
+# Background
+
+We consider the exponentially tilted distribution with density:
+
+$$
+f(x;\theta) = \sqrt{\frac{1}{4\pi}} \cdot \frac{\exp\!\left(-\frac{1}{4x} - \theta x\right)}{x^{3/2}\,\exp\!\left(-\sqrt{\theta}\right)}, \quad x > 0,\; \theta > 0.
+$$
+
+Rearranging, we can write the log-density as:
+
+$$
+\log f(x;\theta) = -\tfrac{1}{2}\log(4\pi) - \tfrac{3}{2}\log x - \frac{1}{4x} - \theta x + \sqrt{\theta}.
+$$
+
+This is an exponentially tilted inverse-Gaussian form. When $\theta = 0$ the
+density reduces to a Lévy($0, 1/2$) distribution (one-sided stable with index
+1/2). The tilting parameter $\theta$ controls how quickly the right tail decays.
+
+Each test dataset consists of $k = 50$ i.i.d. draws from this density under a
+common $\theta$.
+
+## Load the test data
+
+```{r load-data}
+# ------------------------------------------------------------------
+# IMPORTANT: place test_data.RData in your working directory first
+# ------------------------------------------------------------------
+load("test_data.RData")          # should create an object (list of 1000 datasets)
+
+# Inspect the structure – adapt the object name if different
+# Common names the instructor might use: test_data, Z_test, datasets
+# Uncomment and adjust as needed:
+# str(test_data)
+# length(test_data)
+
+# We assume the loaded object is called Z_test (a list of 1000 vectors, each length 50).
+# If the object has a different name, rename it here:
+# Z_test <- test_data          # <-- uncomment / adjust if needed
+
+cat("Number of test datasets:", length(Z_test), "\n")
+cat("Size of first dataset:", length(Z_test[[1]]), "\n")
+head(Z_test[[1]])
+```
+
+# Part 1 – Maximum Likelihood Estimation (30 pts)
+
+## Log-likelihood
+
+For a single dataset $\mathbf{x} = (x_1,\dots,x_k)$ the log-likelihood is
+
+$$
+\ell(\theta) = \sum_{i=1}^{k}\log f(x_i;\theta)
+  = C(\mathbf{x}) - \theta \sum_i x_i + k\sqrt{\theta},
+$$
+
+where $C(\mathbf{x}) = -\frac{k}{2}\log(4\pi) - \frac{3}{2}\sum_i\log x_i - \frac{1}{4}\sum_i \frac{1}{x_i}$
+does not depend on $\theta$.
+
+Setting the derivative to zero:
+
+$$
+\ell'(\theta) = -\sum_i x_i + \frac{k}{2\sqrt{\theta}} = 0
+  \quad\Longrightarrow\quad
+  \hat\theta_{\text{MLE}} = \left(\frac{k}{2\sum_i x_i}\right)^2
+  = \frac{1}{(2\bar x)^2}.
+$$
+
+Because the second derivative $\ell''(\theta) = -\frac{k}{4}\theta^{-3/2} < 0$, this is
+indeed a maximum.
+
+**Special case $\theta = 0$**: The MLE formula always gives $\hat\theta > 0$, but
+for datasets generated under $\theta = 0$ or very small $\theta$, the data will have
+very heavy tails and large $\bar x$, pushing $\hat\theta$ toward zero naturally.
+
+## Implementation
+
+```{r mle}
+# Closed-form MLE
+mle_theta <- function(x) {
+  xbar <- mean(x)
+  (1 / (2 * xbar))^2
+}
+
+# Compute MLE for all 1000 test datasets
+theta_mle <- sapply(Z_test, mle_theta)
+
+cat("Summary of MLE estimates:\n")
+summary(theta_mle)
+```
+
+```{r mle-hist, fig.width=7, fig.height=4}
+hist(theta_mle, breaks = 50, col = "steelblue", border = "white",
+     main = "Distribution of MLE estimates across 1000 test datasets",
+     xlab = expression(hat(theta)[MLE]))
+```
+
+# Part 2 – Neural Bayes Estimation (45 pts)
+
+We use the **NeuralEstimators** R package (which interfaces with Julia)
+to build an amortised neural Bayes estimator. The idea: train a neural
+network on many simulated datasets so that it learns to map a dataset
+of size $k = 50$ to a point estimate of $\theta$.
+
+## Prerequisites
+
+You need Julia installed plus the Julia packages `NeuralEstimators` and
+`Flux`. For GPU support, also install `CUDA` in Julia.
+
+```{r nbe-setup, eval=FALSE}
+# ----- One-time Julia setup (run in Julia REPL, not R) -----
+# using Pkg
+# Pkg.add("NeuralEstimators")
+# Pkg.add("Flux")
+# Pkg.add("CUDA")        # for GPU acceleration (optional)
+# Pkg.add("Distributions")
+
+# ----- R packages -----
+# install.packages("NeuralEstimators")
+# install.packages("JuliaConnectoR")
+```
+
+```{r nbe-libraries, eval=FALSE}
+library(NeuralEstimators)
+library(JuliaConnectoR)
+juliaEval("using NeuralEstimators, Flux, Distributions")
+
+# Check GPU availability
+juliaEval("using CUDA; CUDA.functional()")
+```
+
+## Simulating training data
+
+The homework says $\theta$ values in the test set are concentrated near 0
+(including $\theta=0$ exactly) but spread across $[0, 2]$. Our training
+prior should cover this range and put extra mass near the boundary.
+
+**Training prior for $\theta$**: We use a mixture —
+70 % from $\text{Exponential}(\text{rate}=3)$ (concentrated near 0) and
+30 % from $\text{Uniform}(0, 2.5)$ (covering the full range, slightly wider
+than [0,2] to provide a buffer).
+
+**Simulator**: To sample $X \sim f(\cdot;\theta)$ we use the fact that
+$f(x;\theta)$ is an inverse-Gaussian distribution.
+Specifically, matching the standard parameterisation
+$\text{IG}(\mu, \lambda)$ with $\mu = 1/(2\sqrt{\theta})$ and $\lambda = 1/2$
+gives us the desired density (for $\theta > 0$).
+For $\theta = 0$, the distribution becomes the Lévy distribution; we can
+simulate it as $X = 1/(4Z^2)$ where $Z \sim N(0,1)$.
+
+```{r nbe-sampler-simulator, eval=FALSE}
+# ---- Prior sampler: returns a 1 x K matrix of theta values ----
+sampler <- function(K) {
+  theta_vals <- numeric(K)
+  for (i in 1:K) {
+    if (runif(1) < 0.10) {
+      theta_vals[i] <- 0                      # point mass at 0
+    } else if (runif(1) < 0.667) {
+      theta_vals[i] <- rexp(1, rate = 3)      # concentrated near 0
+    } else {
+      theta_vals[i] <- runif(1, 0, 2.5)       # spread across range
+    }
+  }
+  matrix(theta_vals, nrow = 1)
+}
+
+# ---- Inverse-Gaussian sampler (Michael/Schucany/Haas method) ----
+rinvgauss <- function(n, mu, lambda) {
+  # Generates n draws from IG(mu, lambda)
+  nu <- rnorm(n)
+  y  <- nu^2
+  x  <- mu + (mu^2 * y) / (2 * lambda) -
+    (mu / (2 * lambda)) * sqrt(4 * mu * lambda * y + mu^2 * y^2)
+  z  <- runif(n)
+  ifelse(z <= mu / (mu + x), x, mu^2 / x)
+}
+
+# ---- Data simulator: returns a list of 1 x m matrices ----
+simulator <- function(theta_set, m) {
+  # theta_set is a 1 x K matrix
+  apply(theta_set, 2, function(theta) {
+    if (theta < 1e-12) {
+      # theta ≈ 0: Lévy distribution  X = 1/(4*Z^2)
+      z <- rnorm(m)
+      x <- 1 / (4 * z^2)
+    } else {
+      mu_ig     <- 1 / (2 * sqrt(theta))
+      lambda_ig <- 0.5
+      x <- rinvgauss(m, mu_ig, lambda_ig)
+    }
+    matrix(x, nrow = 1)
+  }, simplify = FALSE)
+}
+```
+
+## Neural network architecture
+
+We use a **DeepSets** architecture — ideal for exchangeable (i.i.d.) data.
+The inner network $\psi$ processes each observation independently, and
+after aggregation (mean pooling), the outer network $\phi$ maps the
+summary to a parameter estimate.
+
+Since $\theta \ge 0$ we use a softplus output to ensure non-negativity.
+
+```{r nbe-architecture, eval=FALSE}
+estimator <- juliaEval('
+  d = 1    # dimension of each observation
+  p = 1    # number of parameters to estimate (theta)
+  w = 128  # hidden layer width
+
+  psi = Chain(Dense(d, w, relu), Dense(w, w, relu), Dense(w, w, relu))
+  phi = Chain(Dense(w, w, relu), Dense(w, w, relu), Dense(w, p, softplus))
+
+  deepset = DeepSet(psi, phi)
+  PointEstimator(deepset)
+')
+```
+
+## Loss function
+
+We use the default **mean-absolute-error (MAE)** loss, which means
+the neural Bayes estimator targets the posterior median. Alternatively
+we could use MSE (targeting the posterior mean). Given that test
+evaluation uses a weighted MSE with heavy weight near $\theta = 0$, MAE
+may provide more robustness near the boundary.
+
+## Training
+
+```{r nbe-train, eval=FALSE}
+estimator <- train(
+  estimator,
+  sampler   = sampler,
+  simulator = simulator,
+  m         = 50L,         # each training dataset has k = 50 observations
+  epochs    = 100L,
+  batchsize = 128L
+  # savepath  = "nbe_weights"   # uncomment to save checkpoints
+)
+```
+
+## Assessing training performance
+
+```{r nbe-risk-plot, eval=FALSE}
+# The train() function prints training/validation risk per epoch.
+# You can also do a manual risk check on held-out simulated data:
+
+K_val  <- 500
+theta_val <- sampler(K_val)
+Z_val     <- simulator(theta_val, 50)
+theta_hat_val <- estimate(estimator, Z_val)
+
+# Scatter: estimated vs true
+plot(as.numeric(theta_val), as.numeric(theta_hat_val),
+     pch = 16, cex = 0.5, col = rgb(0, 0, 0, 0.3),
+     xlab = expression(theta[true]), ylab = expression(hat(theta)[NBE]),
+     main = "NBE: estimated vs. true (validation)")
+abline(0, 1, col = "red", lwd = 2)
+```
+
+## Apply NBE to test data
+
+```{r nbe-test, eval=FALSE}
+# Convert test data to the format expected by NeuralEstimators
+# Each element of Z_test should be a 1 x 50 matrix
+Z_test_formatted <- lapply(Z_test, function(x) matrix(x, nrow = 1))
+
+theta_nbe <- as.numeric(estimate(estimator, Z_test_formatted))
+
+cat("Summary of NBE estimates:\n")
+summary(theta_nbe)
+```
+
+# Part 2 – Alternative: Pure-R Neural Network (no Julia)
+  
+If you cannot install Julia / NeuralEstimators, here is a self-contained
+implementation using the **torch** R package (which supports GPU natively).
+
+```{r torch-setup, eval=FALSE}
+# install.packages("torch")
+library(torch)
+
+# Check GPU
+if (cuda_is_available()) {
+  device <- torch_device("cuda")
+  cat("GPU available! Using CUDA.\n")
+} else {
+  device <- torch_device("cpu")
+  cat("No GPU found. Using CPU.\n")
+}
+```
+
+```{r torch-deepset, eval=FALSE}
+# ---- DeepSets neural network in torch ----
+deepset_module <- nn_module(
+  "DeepSet",
+  initialize = function(d_in = 1, d_out = 1, width = 128) {
+    # Inner network (processes each observation)
+    self$psi <- nn_sequential(
+      nn_linear(d_in, width),
+      nn_relu(),
+      nn_linear(width, width),
+      nn_relu(),
+      nn_linear(width, width),
+      nn_relu()
+    )
+    # Outer network (processes aggregated summary)
+    self$phi <- nn_sequential(
+      nn_linear(width, width),
+      nn_relu(),
+      nn_linear(width, width),
+      nn_relu(),
+      nn_linear(width, d_out),
+      nn_softplus()        # ensures theta >= 0
+    )
+  },
+  forward = function(x) {
+    # x: (batch_size, k, d_in)
+    h <- self$psi(x)           # (batch_size, k, width)
+    h <- h$mean(dim = 2)       # mean pooling over observations -> (batch_size, width)
+    self$phi(h)                # (batch_size, d_out)
+  }
+)
+```
+
+```{r torch-data-generation, eval=FALSE}
+# ---- Simulation functions (same logic as before, pure R) ----
+rinvgauss_vec <- function(n, mu, lambda) {
+  nu <- rnorm(n)
+  y  <- nu^2
+  x  <- mu + (mu^2 * y) / (2 * lambda) -
+    (mu / (2 * lambda)) * sqrt(4 * mu * lambda * y + mu^2 * y^2)
+  z  <- runif(n)
+  ifelse(z <= mu / (mu + x), x, mu^2 / x)
+}
+
+simulate_one_dataset <- function(theta, k = 50) {
+  if (theta < 1e-12) {
+    z <- rnorm(k)
+    1 / (4 * z^2)
+  } else {
+    rinvgauss_vec(k, mu = 1 / (2 * sqrt(theta)), lambda = 0.5)
+  }
+}
+
+sample_theta_prior <- function(K) {
+  theta <- numeric(K)
+  for (i in 1:K) {
+    u <- runif(1)
+    if (u < 0.10) {
+      theta[i] <- 0
+    } else if (u < 0.70) {
+      theta[i] <- rexp(1, rate = 3)
+    } else {
+      theta[i] <- runif(1, 0, 2.5)
+    }
+  }
+  theta
+}
+
+generate_batch <- function(batch_size, k = 50) {
+  thetas <- sample_theta_prior(batch_size)
+  data_list <- lapply(thetas, function(th) simulate_one_dataset(th, k))
+  X <- do.call(rbind, data_list)   # (batch_size, k)
+  list(
+    X     = torch_tensor(X, dtype = torch_float())$unsqueeze(3),  # (B, k, 1)
+    theta = torch_tensor(matrix(thetas, ncol = 1), dtype = torch_float())  # (B, 1)
+  )
+}
+```
+
+```{r torch-training, eval=FALSE}
+# ---- Training loop ----
+model     <- deepset_module()$to(device = device)
+optimizer <- optim_adam(model$parameters, lr = 1e-3)
+scheduler <- lr_step(optimizer, step_size = 30, gamma = 0.5)
+
+n_epochs    <- 100
+batch_size  <- 256
+steps_per_epoch <- 100
+k <- 50
+
+train_losses <- numeric(n_epochs)
+val_losses   <- numeric(n_epochs)
+
+# Fixed validation set
+val_batch <- generate_batch(2000, k)
+val_X     <- val_batch$X$to(device = device)
+val_theta <- val_batch$theta$to(device = device)
+
+for (epoch in 1:n_epochs) {
+  model$train()
+  epoch_loss <- 0
+  
+  for (step in 1:steps_per_epoch) {
+    batch <- generate_batch(batch_size, k)
+    X_batch     <- batch$X$to(device = device)
+    theta_batch <- batch$theta$to(device = device)
+    
+    optimizer$zero_grad()
+    theta_hat <- model(X_batch)
+    
+    # Weighted MAE loss (up-weight small theta)
+    weights <- 1 / (theta_batch + 0.001)
+    loss <- (weights * torch_abs(theta_hat - theta_batch))$mean()
+    
+    loss$backward()
+    optimizer$step()
+    
+    epoch_loss <- epoch_loss + loss$item()
+  }
+  
+  scheduler$step()
+  train_losses[epoch] <- epoch_loss / steps_per_epoch
+  
+  # Validation
+  model$eval()
+  with_no_grad({
+    val_hat  <- model(val_X)
+    val_w    <- 1 / (val_theta + 0.001)
+    val_loss <- (val_w * torch_abs(val_hat - val_theta))$mean()
+    val_losses[epoch] <- val_loss$item()
+  })
+  
+  if (epoch %% 10 == 0) {
+    cat(sprintf("Epoch %3d | Train loss: %.4f | Val loss: %.4f\n",
+                epoch, train_losses[epoch], val_losses[epoch]))
+  }
+}
+```
+
+```{r torch-training-plot, eval=FALSE}
+plot(1:n_epochs, train_losses, type = "l", col = "blue",
+     xlab = "Epoch", ylab = "Weighted MAE Loss",
+     main = "Training and Validation Loss")
+lines(1:n_epochs, val_losses, col = "red")
+legend("topright", legend = c("Train", "Validation"),
+       col = c("blue", "red"), lty = 1)
+```
+
+```{r torch-apply-test, eval=FALSE}
+# ---- Apply trained model to the 1000 test datasets ----
+model$eval()
+
+X_test_mat <- do.call(rbind, lapply(Z_test, function(x) as.numeric(x)))
+X_test_tensor <- torch_tensor(X_test_mat, dtype = torch_float())$unsqueeze(3)$to(device = device)
+
+with_no_grad({
+  theta_nbe <- as.numeric(model(X_test_tensor)$cpu())
+})
+
+cat("Summary of NBE estimates:\n")
+summary(theta_nbe)
+```
+
+# Part 3 – MCMC (10 bonus points)
+
+We implement a Metropolis–Hastings sampler for the posterior of $\theta$
+given a dataset. We use the same prior as in the NBE:
+$\pi(\theta) \propto 0.10\,\delta_0(\theta) + 0.60\cdot 3e^{-3\theta} + 0.30\cdot\mathbf{1}_{[0,2.5]}(\theta)/2.5$.
+
+Since $\theta$ is continuous and the point mass at 0 complicates mixing,
+in practice we use a continuous approximation:
+$\pi(\theta) \propto 3e^{-3\theta}\,\mathbf{1}(\theta \ge 0)$
+(an Exponential(3) prior), which places heavy mass near 0 and is proper.
+
+## Log-posterior
+
+```{r mcmc-logpost}
+log_likelihood <- function(theta, x) {
+  k <- length(x)
+  if (theta < 0) return(-Inf)
+  # Constant terms
+  C <- -k/2 * log(4 * pi) - 1.5 * sum(log(x)) - 0.25 * sum(1/x)
+  C - theta * sum(x) + k * sqrt(max(theta, 0))
+}
+
+log_prior <- function(theta) {
+  if (theta < 0) return(-Inf)
+  # Exponential(rate=3) prior
+  log(3) - 3 * theta
+}
+
+log_posterior <- function(theta, x) {
+  log_likelihood(theta, x) + log_prior(theta)
+}
+```
+
+## Metropolis–Hastings sampler
+
+We use a random-walk proposal on the log scale to respect the
+non-negativity constraint: propose
+$\log\theta^* = \log\theta^{(t)} + \epsilon$, $\epsilon \sim N(0, \sigma^2_\text{prop})$.
+
+```{r mcmc-sampler}
+mcmc_sample <- function(x, n_iter = 20000, burn = 5000, 
+                         theta_init = NULL, sigma_prop = 0.5) {
+  k <- length(x)
+  
+  # Starting value: MLE
+  if (is.null(theta_init)) {
+    theta_init <- max(mle_theta(x), 1e-6)
+  }
+  
+  chain <- numeric(n_iter)
+  chain[1] <- theta_init
+  accept <- 0
+  
+  for (t in 2:n_iter) {
+    theta_current <- chain[t - 1]
+    
+    # Propose on log scale
+    log_theta_star <- log(theta_current) + rnorm(1, 0, sigma_prop)
+    theta_star <- exp(log_theta_star)
+    
+    # Log acceptance ratio (including Jacobian for log-transform)
+    log_alpha <- log_posterior(theta_star, x) - log_posterior(theta_current, x) +
+      log(theta_star) - log(theta_current)   # Jacobian
+    
+    if (log(runif(1)) < log_alpha) {
+      chain[t] <- theta_star
+      accept <- accept + 1
+    } else {
+      chain[t] <- theta_current
+    }
+  }
+  
+  list(chain = chain, accept_rate = accept / (n_iter - 1), burn = burn)
+}
+```
+
+## Convergence diagnostics for first test dataset
+
+```{r mcmc-diagnostics, fig.width=8, fig.height=8}
+# Run MCMC on the first test dataset
+res1 <- mcmc_sample(Z_test[[1]], n_iter = 30000, burn = 5000, sigma_prop = 0.3)
+
+cat("Acceptance rate:", round(res1$accept_rate, 3), "\n")
+
+chain_post <- res1$chain[(res1$burn + 1):length(res1$chain)]
+
+par(mfrow = c(2, 2))
+
+# Trace plot
+plot(chain_post, type = "l", col = "grey40",
+     main = "Trace plot for θ (post burn-in)",
+     xlab = "Iteration", ylab = expression(theta))
+abline(h = mean(chain_post), col = "red", lwd = 2)
+
+# Histogram
+hist(chain_post, breaks = 50, col = "steelblue", border = "white",
+     main = "Posterior distribution of θ",
+     xlab = expression(theta), probability = TRUE)
+abline(v = mean(chain_post), col = "red", lwd = 2)
+abline(v = quantile(chain_post, c(0.025, 0.975)), col = "blue", lty = 2)
+
+# ACF
+acf(chain_post, lag.max = 100, main = "Autocorrelation")
+
+# Running mean
+running_mean <- cumsum(chain_post) / seq_along(chain_post)
+plot(running_mean, type = "l", col = "steelblue",
+     main = "Running mean",
+     xlab = "Iteration", ylab = expression(bar(theta)))
+
+par(mfrow = c(1, 1))
+
+cat("\nPosterior summary for test dataset 1:\n")
+cat("  Mean:           ", round(mean(chain_post), 5), "\n")
+cat("  Median:         ", round(median(chain_post), 5), "\n")
+cat("  95% CI:         [", round(quantile(chain_post, 0.025), 5), ",",
+    round(quantile(chain_post, 0.975), 5), "]\n")
+cat("  Effective size: ", round(coda::effectiveSize(chain_post), 1), "\n")
+```
+
+## Run MCMC for all 1000 test datasets
+
+```{r mcmc-all, eval=FALSE}
+# This takes a while — ~10 min depending on chain length
+theta_mcmc <- numeric(length(Z_test))
+
+for (i in seq_along(Z_test)) {
+  res <- mcmc_sample(Z_test[[i]], n_iter = 20000, burn = 5000, sigma_prop = 0.3)
+  chain_post <- res$chain[(res$burn + 1):length(res$chain)]
+  theta_mcmc[i] <- mean(chain_post)
+  
+  if (i %% 100 == 0) cat("Done", i, "of", length(Z_test), "\n")
+}
+
+cat("Summary of MCMC posterior means:\n")
+summary(theta_mcmc)
+```
+
+# Evaluation
+
+Compute the weighted MSE for each method:
+
+$$
+\text{MSE} = \frac{1}{1000}\sum_{i=1}^{1000} w(\theta_i)\,(\hat\theta_i - \theta_i)^2, \quad w(\theta_i) = \frac{1}{\theta_i + 0.001}.
+$$
+
+```{r evaluation, eval=FALSE}
+# You need the true theta values — these come with test_data.RData
+# Adjust the object name as needed (e.g., theta_true, true_theta)
+# theta_true <- ...
+
+wmse <- function(theta_hat, theta_true, delta = 0.001) {
+  w <- 1 / (theta_true + delta)
+  mean(w * (theta_hat - theta_true)^2)
+}
+
+cat("Weighted MSE — MLE: ", wmse(theta_mle, theta_true), "\n")
+cat("Weighted MSE — NBE: ", wmse(theta_nbe, theta_true), "\n")
+# cat("Weighted MSE — MCMC:", wmse(theta_mcmc, theta_true), "\n")
+```
+
+# Saving estimates for submission
+
+```{r save-results, eval=FALSE}
+results <- data.frame(
+  dataset = 1:1000,
+  MLE     = theta_mle,
+  NBE     = theta_nbe
+  # MCMC  = theta_mcmc    # uncomment if you ran MCMC
+)
+write.csv(results, "HW3_P2_estimates.csv", row.names = FALSE)
+
+save(theta_mle, theta_nbe, file = "HW3_P2_estimates.RData")
+# save(theta_mle, theta_nbe, theta_mcmc, file = "HW3_P2_estimates.RData")
+```
+
+# Uncertainty Comparison (Bonus)
+
+## NBE Uncertainty via Bootstrap
+
+```{r nbe-bootstrap, eval=FALSE}
+# Using NeuralEstimators package:
+theta_hat_1 <- estimate(estimator, Z_test_formatted[[1]])
+boot_mat    <- bootstrap(estimator, Z_test_formatted[[1]], B = 1000)
+
+cat("NBE point estimate for dataset 1:", as.numeric(theta_hat_1), "\n")
+cat("Bootstrap 95% CI: [", quantile(boot_mat[1,], 0.025), ",",
+    quantile(boot_mat[1,], 0.975), "]\n")
+cat("Bootstrap SD:", sd(boot_mat[1,]), "\n")
+
+hist(boot_mat[1,], breaks = 30, col = "steelblue", border = "white",
+     main = "NBE Bootstrap Distribution (Dataset 1)",
+     xlab = expression(hat(theta)))
+abline(v = as.numeric(theta_hat_1), col = "red", lwd = 2)
+```
+
+## Comparison Summary
+
+```{r comparison, eval=FALSE}
+cat("\n=== Uncertainty Comparison for Test Dataset 1 ===\n\n")
+
+# MCMC results (already computed above)
+cat("MCMC:\n")
+cat("  Posterior mean:  ", round(mean(chain_post), 5), "\n")
+cat("  95% credible CI: [", round(quantile(chain_post, 0.025), 5), ",",
+    round(quantile(chain_post, 0.975), 5), "]\n\n")
+
+# NBE results
+cat("NBE:\n")
+cat("  Point estimate:  ", round(as.numeric(theta_hat_1), 5), "\n")
+cat("  95% bootstrap CI:[", round(quantile(boot_mat[1,], 0.025), 5), ",",
+    round(quantile(boot_mat[1,], 0.975), 5), "]\n")
+```
