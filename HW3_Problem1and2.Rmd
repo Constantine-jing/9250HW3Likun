@@ -14,6 +14,103 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 set.seed(2026)
 ```
 
+## Problem 1
+
+We have a dataset given to us as peru.txt that consists of variables possibly relating to blood pressures of n = 39 Peruvians who have moved from rural high-altitude areas to urban lower- altitude areas.
+
+Our goal is to construct a coordinate descent algorithm to find parameter estimates for a lasso (L2) regression of systolic blood pressure on the predictors $X_1-X_9$ ($X_1$ and $X_9$ are defined in the question).
+
+
+### (1) Pseudocode
+
+We have the lasso problem 
+$$
+\min_{\boldsymbol\beta \in \mathbb{R}^{p}}\;
+\tfrac{1}{2}\,\big\|\mathbf{y} - X\boldsymbol\beta\big\|_{2}^{2}
+\;+\; \lambda\,\|\boldsymbol\beta\|_{1}.
+$$
+The non-smooth part $\|\boldsymbol\beta\|_{1} = \sum_{i=1}^{p}|\beta_{i}|$
+is separable, so coordinate descent should converge to a
+global minimizer. Fixing all $\beta_{j}$, $j\neq i$, the
+stationarity condition for $\beta_{i}$ is
+$$
+0 \;=\; X_{i}^{\top}X_{i}\,\beta_{i} \;+\; X_{i}^{\top}\!\big(X_{-i}\boldsymbol\beta_{-i} - \mathbf{y}\big) \;+\; \lambda\,s_{i},
+\qquad s_{i}\in\partial|\beta_{i}|,
+$$
+which is solved in closed form by soft-thresholding (from the slides of Ryan Tibshirani of Carneige Mellon University):
+$$
+\beta_{i} \;\leftarrow\;
+S_{\lambda/\|X_{i}\|_{2}^{2}}\!\left(
+\frac{X_{i}^{\top}\!\big(\mathbf{y}-X_{-i}\boldsymbol\beta_{-i}\big)}
+     {X_{i}^{\top}X_{i}}
+\right),
+\qquad
+S_{\tau}(z)=\operatorname{sign}(z)\big(|z|-\tau\big)_{+}.
+$$
+Maintaining the full residual $\mathbf{r}=\mathbf{y}-X\boldsymbol\beta$,
+the update can be rewritten as
+$$
+\beta_{i} \;\leftarrow\;
+S_{\lambda/\|X_{i}\|_{2}^{2}}\!\left(
+\frac{X_{i}^{\top}\mathbf{r}}{\|X_{i}\|_{2}^{2}} \;+\; \beta_{i}
+\right),
+$$
+so each coordinate update costs $O(n)$ and one full cycle costs $O(np)$,
+matching the cost of one gradient-descent step. Following from the above theory, the pseudo code for our coordinate descent algorithm is as follows:
+
+```text
+Inputs: Response variable  y  (in R)
+        Design matrix    X  (in R^{n x p}, having columns X_1, ..., X_p)
+        Penalty hyperparameter   lambda > 0
+        A tolerance limit      (e.g. 1e-7)
+        Number of cycles (maximum) K_max
+
+Step 1. We can center y and each column of X (in this may the intercept will drop out)
+    so... y    <- y - mean(y)
+          X_i  <- X_i - mean(X_i),     i = 1, ..., p
+
+Step 2. Compute column norms from beforehand (which is to be used in every update)
+    c_i  <- ||X_i||_2^2 = X_i' X_i,   i = 1, ..., p
+
+Step 3. Now we Initialize everything as zero 
+    beta <- (0, 0, ..., 0)            # p-vector of zeros
+    r    <- y                         # since beta = 0
+    k    <- 0
+
+Step 4. Cyclic coordinate descent
+    repeat
+        beta_old <- beta
+        for i = 1, 2, ..., p do
+            # 1. Add coordinate i back into the residual
+            r <- r + X_i * beta[i]
+
+            # 2. Univariate OLS coefficient on the partial residual
+            z_i <- (X_i' r) / c_i
+
+            # 3. Soft-thresholding update (slide 13)
+            beta[i] <- sign(z_i) * max( |z_i| - lambda / c_i , 0 )
+
+            # 4. Subtract the new contribution back out of the residual
+            r = K_max
+
+Step 5. Recover the intercept on the original (uncentered) scale
+    beta_0 <- mean(y_orig) - sum_i ( beta[i] * mean(X_i_orig) )
+
+Output: (beta_0, beta_1, ..., beta_p)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
 # Background
 
 We consider the exponentially tilted distribution with density:
