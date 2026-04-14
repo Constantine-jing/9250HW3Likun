@@ -1,0 +1,437 @@
+---
+title: "HW3 Problem 2 — Neural Bayes Estimators (v2)"
+author: "Team Members"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+set.seed(2026)
+```
+
+# Background
+
+Density:
+$$f(x;\theta) = \sqrt{\tfrac{1}{4\pi}}\cdot\frac{\exp(-\tfrac{1}{4x}-\theta x)}{x^{3/2}\exp(-\sqrt\theta)},\; x>0,\theta\ge 0.$$
+This is IG$(\mu=\tfrac{1}{2\sqrt\theta},\lambda=\tfrac12)$ for $\theta>0$, Lévy for $\theta=0$.
+
+Each test dataset: $k=50$ i.i.d. draws. 1000 test datasets total.
+
+# Load test data
+
+```{r load}
+load("test_data.RData")
+cat("N datasets:", length(Z_test), " size each:", length(Z_test[[1]]), "\n")
+```
+
+# Part 1 — MLE (30 pts)
+
+Log-likelihood: $\ell(\theta)=C(\mathbf x)-\theta\sum x_i + k\sqrt\theta$.
+Setting $\ell'(\theta)=0$ gives closed form $\hat\theta_{\text{MLE}}=1/(2\bar x)^2$.
+
+```{r mle}
+mle_theta <- function(x) (1 / (2 * mean(x)))^2
+theta_mle <- sapply(Z_test, mle_theta)
+summary(theta_mle)
+hist(theta_mle, breaks = 50, col = "steelblue",
+     main = "MLE estimates", xlab = expression(hat(theta)[MLE]))
+```
+
+# Part 2 — Neural Bayes Estimator (45 pts)
+
+Strategy for weighted MSE $w(\theta)=1/(\theta+0.001)$ (heavy near boundary):
+
+1. Boundary-heavy training prior (30% zeros, 50% Exp(8), 20% Unif[0,2.5])
+2. Enriched features $[x_i, 1/x_i, \log x_i]$
+3. Six expert summary statistics fed to outer network
+4. **Custom weighted loss** matching the scoring metric
+5. Gradient clipping + cosine LR schedule to prevent divergence
+6. 5-member ensemble averaging
+7. Post-processing: clip predictions $< 0.0005$ to exactly 0
+
+## Setup
+
+```{r torch-setup}
+# install.packages("torch")   # one-time
+library(torch)
+device <- if (cuda_is_available()) torch_device("cuda") else torch_device("cpu")
+cat("Using:", as.character(device), "\n")
+```
+
+## Simulator
+
+```{r simulator}
+rinvgauss_vec <- function(n, mu, lambda) {
+  nu <- rnorm(n); y <- nu^2
+  x  <- mu + (mu^2 * y)/(2*lambda) -
+    (mu/(2*lambda)) * sqrt(4*mu*lambda*y + mu^2*y^2)
+  ifelse(runif(n) <= mu/(mu+x), x, mu^2/x)
+}
+
+sim_one_dataset <- function(theta, k = 50) {
+  if (theta < 1e-12) { z <- rnorm(k); 1/(4*z^2) }
+  else rinvgauss_vec(k, mu = 1/(2*sqrt(theta)), lambda = 0.5)
+}
+
+sample_prior <- function(K) {
+  th <- numeric(K)
+  for (i in 1:K) {
+    u <- runif(1)
+    if (u < 0.30)      th[i] <- 0
+    else if (u < 0.80) th[i] <- rexp(1, 8)
+    else               th[i] <- runif(1, 0, 2.5)
+  }
+  th
+}
+```
+
+## Batch generator
+
+```{r batch}
+gen_batch <- function(B, k = 50) {
+  thetas <- sample_prior(B)
+  X <- matrix(NA, B, k); ES <- matrix(NA, B, 6)
+  for (i in 1:B) {
+    x <- sim_one_dataset(thetas[i], k); X[i, ] <- x
+    ES[i, ] <- c(
+      (1/(2*mean(x)))^2, min(x), median(x),
+      sd(log(x)), mean(1/x),
+      quantile(x, 0.10, names = FALSE)
+    )
+  }
+  feat <- array(0, dim = c(B, k, 3))
+  feat[,,1] <- X; feat[,,2] <- 1/X; feat[,,3] <- log(X)
+  list(
+    X     = torch_tensor(feat, dtype = torch_float()),
+    S     = torch_tensor(ES,   dtype = torch_float()),
+    theta = torch_tensor(matrix(thetas, ncol = 1), dtype = torch_float())
+  )
+}
+```
+
+## DeepSets architecture
+
+```{r model}
+deepset <- nn_module(
+  initialize = function(d_in = 3, d_expert = 6, w = 128) {
+    self$psi <- nn_sequential(
+      nn_linear(d_in, w), nn_relu(),
+      nn_linear(w, w),    nn_relu(),
+      nn_linear(w, w),    nn_relu()
+    )
+    self$phi <- nn_sequential(
+      nn_linear(w + d_expert, w), nn_relu(),
+      nn_linear(w, w),            nn_relu(),
+      nn_linear(w, w),            nn_relu(),
+      nn_linear(w, 1),            nn_softplus()
+    )
+  },
+  forward = function(X, S) {
+    h <- self$psi(X)$mean(dim = 2)
+    self$phi(torch_cat(list(h, S), dim = 2))
+  }
+)
+
+weighted_loss <- function(pred, true) {
+  w <- 1 / (true + 0.001)
+  (w * (pred - true)^2)$mean()
+}
+```
+
+## Trainer (grad clipping + cosine LR)
+
+```{r trainer}
+train_one <- function(seed, epochs = 150, batch = 256, k = 50,
+                      steps_per_epoch = 50, lr_init = 3e-3) {   # was 1e-3
+  torch_manual_seed(seed); set.seed(seed)
+  model <- deepset()$to(device = device)
+  opt   <- optim_adam(model$parameters, lr = lr_init)
+
+  val <- gen_batch(2000, k)
+  vX <- val$X$to(device = device)
+  vS <- val$S$to(device = device)
+  vT <- val$theta$to(device = device)
+
+  best_vl <- Inf
+
+  for (e in 1:epochs) {
+    lr_now <- lr_init * 0.5 * (1 + cos(pi * (e - 1) / epochs))
+    for (pg in opt$param_groups) pg$lr <- lr_now
+
+    model$train()
+    for (s in 1:steps_per_epoch) {
+      b <- gen_batch(batch, k)
+      bX <- b$X$to(device = device)
+      bS <- b$S$to(device = device)
+      bT <- b$theta$to(device = device)
+
+      opt$zero_grad()
+      loss <- weighted_loss(model(bX, bS), bT)
+      loss$backward()
+      nn_utils_clip_grad_norm_(model$parameters, max_norm = 10.0)
+      opt$step()
+    }
+
+    if (e %% 15 == 0 || e == epochs) {
+      model$eval()
+      with_no_grad({ vl <- weighted_loss(model(vX, vS), vT)$item() })
+      if (vl < best_vl) best_vl <- vl
+      cat(sprintf("seed %d  epoch %3d  lr %.5f  val wMSE = %.4f  (best %.4f)\n",
+                  seed, e, lr_now, vl, best_vl))
+    }
+  }
+  model
+}
+```
+
+## Train ensemble of 5
+
+```{r ensemble}
+models <- list()
+seeds  <- c(1111, 2222, 3333, 4444, 5555)
+
+t0 <- Sys.time()
+for (i in seq_along(seeds)) {
+  cat("\n=== member", i, "of", length(seeds), "===\n")
+  models[[i]] <- train_one(seed = seeds[i], epochs = 150)
+}
+cat("\nTotal training:",
+    round(as.numeric(Sys.time() - t0, units = "mins"), 1), "min\n")
+```
+
+## Apply ensemble to 1000 test datasets
+
+```{r predict}
+B <- length(Z_test); k <- 50
+Xfeat <- array(0, dim = c(B, k, 3)); ES <- matrix(NA, B, 6)
+for (i in 1:B) {
+  x <- as.numeric(Z_test[[i]])
+  Xfeat[i,,1] <- x; Xfeat[i,,2] <- 1/x; Xfeat[i,,3] <- log(x)
+  ES[i, ] <- c((1/(2*mean(x)))^2, min(x), median(x),
+               sd(log(x)), mean(1/x), quantile(x, 0.10, names = FALSE))
+}
+tX <- torch_tensor(Xfeat, dtype = torch_float())$to(device = device)
+tS <- torch_tensor(ES,    dtype = torch_float())$to(device = device)
+
+preds <- matrix(NA, length(models), B)
+for (i in seq_along(models)) {
+  models[[i]]$eval()
+  with_no_grad({ preds[i, ] <- as.numeric(models[[i]](tX, tS)$cpu()) })
+}
+
+theta_nbe <- pmax(colMeans(preds), 0)
+theta_nbe[theta_nbe < 0.0005] <- 0
+summary(theta_nbe)
+
+hist(theta_nbe, breaks = 50, col = "coral",
+     main = "NBE ensemble estimates", xlab = expression(hat(theta)[NBE]))
+```
+
+## Self-check on simulated holdout
+
+```{r holdout-check}
+set.seed(99)
+holdout <- gen_batch(2000, k = 50)
+hX <- holdout$X$to(device = device)
+hS <- holdout$S$to(device = device)
+hT <- as.numeric(holdout$theta$cpu())
+
+preds_h <- matrix(NA, length(models), 2000)
+for (i in seq_along(models)) {
+  models[[i]]$eval()
+  with_no_grad({ preds_h[i, ] <- as.numeric(models[[i]](hX, hS)$cpu()) })
+}
+nbe_h <- pmax(colMeans(preds_h), 0)
+nbe_h[nbe_h < 0.0005] <- 0
+
+x_raw   <- as_array(holdout$X$cpu())[, , 1]
+mle_h   <- apply(x_raw, 1, function(xx) (1 / (2 * mean(xx)))^2)
+
+wmse <- function(hat, tru, d = 0.001) mean((hat - tru)^2 / (tru + d))
+cat("Simulated holdout wMSE:\n")
+cat("  MLE:", round(wmse(mle_h, hT), 5), "\n")
+cat("  NBE:", round(wmse(nbe_h, hT), 5), "\n")
+cat("  Improvement factor:", round(wmse(mle_h, hT) / wmse(nbe_h, hT), 1), "x\n")
+```
+
+# Part 3 — MCMC (10 bonus pts) via Rcpp
+
+```{r mcmc-rcpp}
+library(Rcpp)
+
+cppFunction('
+NumericVector mh_sampler_cpp(NumericVector x, int n_iter, double sigma_prop,
+                              double theta_init, double prior_rate) {
+  int k = x.size();
+  double sum_x = 0.0, sum_log_x = 0.0, sum_inv_x = 0.0;
+  for (int i = 0; i < k; i++) {
+    sum_x     += x[i];
+    sum_log_x += log(x[i]);
+    sum_inv_x += 1.0 / x[i];
+  }
+  double C = -0.5 * k * log(4.0 * M_PI) - 1.5 * sum_log_x - 0.25 * sum_inv_x;
+
+  NumericVector chain(n_iter);
+  chain[0] = theta_init;
+  double log_post_cur = C - theta_init * sum_x + k * sqrt(theta_init)
+                         + log(prior_rate) - prior_rate * theta_init;
+
+  for (int t = 1; t < n_iter; t++) {
+    double theta_cur = chain[t - 1];
+    double log_theta_star = log(theta_cur) + R::rnorm(0.0, sigma_prop);
+    double theta_star = exp(log_theta_star);
+
+    double log_post_star = C - theta_star * sum_x + k * sqrt(theta_star)
+                             + log(prior_rate) - prior_rate * theta_star;
+
+    double log_alpha = log_post_star - log_post_cur +
+                       log(theta_star) - log(theta_cur);
+
+    if (log(R::runif(0.0, 1.0)) < log_alpha) {
+      chain[t]     = theta_star;
+      log_post_cur = log_post_star;
+    } else {
+      chain[t] = theta_cur;
+    }
+  }
+  return chain;
+}
+')
+
+mcmc_sample <- function(x, n_iter = 20000, burn = 5000,
+                        sigma_prop = 0.3, prior_rate = 3) {
+  theta_init <- max((1/(2*mean(x)))^2, 1e-6)
+  chain <- mh_sampler_cpp(x, n_iter, sigma_prop, theta_init, prior_rate)
+  list(chain = chain, burn = burn, post = chain[(burn+1):n_iter])
+}
+```
+
+## Convergence diagnostics for test dataset 1
+
+```{r mcmc-diag, fig.width=9, fig.height=7}
+res1 <- mcmc_sample(Z_test[[1]], n_iter = 30000, burn = 5000, sigma_prop = 0.3)
+chain_post <- res1$post
+
+cat("Posterior mean:  ", round(mean(chain_post), 5), "\n")
+cat("Posterior median:", round(median(chain_post), 5), "\n")
+cat("95% CI: [", round(quantile(chain_post, 0.025), 5), ",",
+    round(quantile(chain_post, 0.975), 5), "]\n")
+cat("ESS:", round(coda::effectiveSize(chain_post), 1), "\n")
+
+par(mfrow = c(2, 2))
+plot(chain_post, type = "l", col = "grey40",
+     main = "Trace (post burn-in)", xlab = "Iter", ylab = expression(theta))
+abline(h = mean(chain_post), col = "red", lwd = 2)
+
+hist(chain_post, breaks = 50, col = "steelblue", border = "white",
+     probability = TRUE, main = "Posterior", xlab = expression(theta))
+abline(v = mean(chain_post), col = "red", lwd = 2)
+abline(v = quantile(chain_post, c(0.025, 0.975)), col = "blue", lty = 2)
+
+acf(chain_post, lag.max = 100, main = "Autocorrelation")
+
+rm_vals <- cumsum(chain_post) / seq_along(chain_post)
+plot(rm_vals, type = "l", col = "steelblue",
+     main = "Running mean", xlab = "Iter", ylab = expression(bar(theta)))
+par(mfrow = c(1, 1))
+```
+
+## Run MCMC on all 1000 datasets
+
+```{r mcmc-all}
+theta_mcmc <- numeric(length(Z_test))
+t0 <- Sys.time()
+for (i in seq_along(Z_test)) {
+  res <- mcmc_sample(Z_test[[i]], n_iter = 20000, burn = 5000)
+  theta_mcmc[i] <- mean(res$post)
+}
+cat("MCMC total time:",
+    round(as.numeric(Sys.time() - t0, units = "secs"), 1), "s\n")
+summary(theta_mcmc)
+```
+
+# Uncertainty Comparison (20 bonus pts) — Test Dataset 1
+
+## NBE bootstrap
+
+```{r nbe-bootstrap, fig.width=7, fig.height=5}
+B_boot <- 1000
+x1 <- as.numeric(Z_test[[1]])
+set.seed(2026)
+boot_idx <- matrix(sample(1:k, B_boot * k, replace = TRUE), B_boot, k)
+
+Xboot <- array(0, dim = c(B_boot, k, 3))
+Sboot <- matrix(NA, B_boot, 6)
+for (b in 1:B_boot) {
+  xb <- x1[boot_idx[b, ]]
+  Xboot[b,,1] <- xb; Xboot[b,,2] <- 1/xb; Xboot[b,,3] <- log(xb)
+  Sboot[b, ] <- c((1/(2*mean(xb)))^2, min(xb), median(xb),
+                  sd(log(xb)), mean(1/xb),
+                  quantile(xb, 0.10, names = FALSE))
+}
+tXb <- torch_tensor(Xboot, dtype = torch_float())$to(device = device)
+tSb <- torch_tensor(Sboot, dtype = torch_float())$to(device = device)
+
+boot_preds <- matrix(NA, length(models), B_boot)
+for (i in seq_along(models)) {
+  models[[i]]$eval()
+  with_no_grad({
+    boot_preds[i, ] <- as.numeric(models[[i]](tXb, tSb)$cpu())
+  })
+}
+theta_boot <- pmax(colMeans(boot_preds), 0)
+theta_hat_1 <- theta_nbe[1]
+
+cat("NBE for dataset 1:\n")
+cat("  Point est: ", round(theta_hat_1, 5), "\n")
+cat("  Boot SD:   ", round(sd(theta_boot), 5), "\n")
+cat("  95% boot CI: [", round(quantile(theta_boot, 0.025), 5), ",",
+    round(quantile(theta_boot, 0.975), 5), "]\n")
+
+hist(theta_boot, breaks = 40, col = "coral", border = "white",
+     main = "NBE Bootstrap (Dataset 1)", xlab = expression(hat(theta)))
+abline(v = theta_hat_1, col = "red", lwd = 2)
+abline(v = quantile(theta_boot, c(0.025, 0.975)), col = "blue", lty = 2, lwd = 2)
+```
+
+## Side-by-side comparison
+
+```{r compare, fig.width=9, fig.height=4}
+mcmc_ci <- quantile(chain_post, c(0.025, 0.975))
+nbe_ci  <- quantile(theta_boot, c(0.025, 0.975))
+
+comparison <- data.frame(
+  Method   = c("MCMC", "NBE bootstrap"),
+  PointEst = c(round(mean(chain_post), 5), round(theta_hat_1, 5)),
+  SD       = c(round(sd(chain_post), 5),   round(sd(theta_boot), 5)),
+  CI_lo    = c(round(mcmc_ci[1], 5),       round(nbe_ci[1], 5)),
+  CI_hi    = c(round(mcmc_ci[2], 5),       round(nbe_ci[2], 5)),
+  Width    = c(round(diff(mcmc_ci), 5),    round(diff(nbe_ci), 5))
+)
+print(comparison, row.names = FALSE)
+
+par(mfrow = c(1, 2))
+hist(chain_post, breaks = 50, col = "steelblue", border = "white",
+     probability = TRUE, main = "MCMC posterior", xlab = expression(theta),
+     xlim = range(c(chain_post, theta_boot)))
+abline(v = mean(chain_post), col = "red", lwd = 2)
+abline(v = mcmc_ci, col = "darkblue", lty = 2, lwd = 2)
+
+hist(theta_boot, breaks = 50, col = "coral", border = "white",
+     probability = TRUE, main = "NBE bootstrap", xlab = expression(theta),
+     xlim = range(c(chain_post, theta_boot)))
+abline(v = theta_hat_1, col = "red", lwd = 2)
+abline(v = nbe_ci, col = "darkblue", lty = 2, lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+# Save all results
+
+```{r save}
+save(theta_mle, theta_nbe, theta_mcmc, chain_post, theta_boot,
+     file = "HW3_P2_final.RData")
+write.csv(data.frame(MLE = theta_mle, NBE = theta_nbe, MCMC = theta_mcmc),
+          "HW3_P2_estimates.csv", row.names = FALSE)
+cat("Saved.\n")
+```
