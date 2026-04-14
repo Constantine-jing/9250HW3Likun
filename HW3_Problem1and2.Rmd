@@ -87,7 +87,10 @@ Step 4. Cyclic coordinate descent
             beta[i] <- sign(z_i) * max( |z_i| - lambda / c_i , 0 )
 
             # 4. Subtract the new contribution back out of the residual
-            r = K_max
+            r <- r - X_i * beta[i]
+        end for
+        k <- k + 1
+    until ( max_i |beta[i] - beta_old[i]| < tol )  or  k >= K_max
 
 Step 5. Recover the intercept on the original (uncentered) scale
     beta_0 <- mean(y_orig) - sum_i ( beta[i] * mean(X_i_orig) )
@@ -95,7 +98,100 @@ Step 5. Recover the intercept on the original (uncentered) scale
 Output: (beta_0, beta_1, ..., beta_p)
 ```
 
+### (2) Implementation details
 
+**Starting values.** All coefficients are initialized at zero
+($\boldsymbol\beta^{(0)} = \mathbf 0$). For lasso this is the natural
+choice because the L1 penalty pulls coefficients toward zero, so a
+zero start is consistent with the expected sparse solution.
+
+**Stopping criterion.** The algorithm terminates when the maximum
+absolute change in any coefficient between two successive full sweeps
+falls below $\text{tol} = 10^{-7}$:
+$$\max_{i} \,\bigl|\beta_i^{(k+1)} - \beta_i^{(k)}\bigr| < 10^{-7}.$$
+We additionally enforce a hard cap of $K_{\max} = 10000$ cycles as a
+safety net, though convergence occurs in well under 100 cycles in
+practice.
+
+**Standardization.** Each predictor is centered and scaled to unit
+standard deviation, and the response is centered. This ensures a
+single $\lambda$ penalizes all coefficients on a comparable scale.
+After fitting, coefficients are converted back to the original scale
+and the intercept is recovered from the means.
+
+**Penalty selection.** We select $\lambda$ by 10-fold cross-validation
+using `glmnet::cv.glmnet`, then refit the coefficients with our own
+coordinate descent at $\lambda_{\min}$.
+
+### (3) Parameter estimates
+
+```{r p1-fit, message=FALSE, warning=FALSE}
+soft_threshold <- function(z, lam) sign(z) * max(abs(z) - lam, 0)
+
+lasso_cd <- function(X, y, lambda, tol = 1e-7, max_iter = 10000) {
+  n <- nrow(X); p <- ncol(X)
+  X_means <- colMeans(X); X_sds <- apply(X, 2, sd)
+  X_std   <- scale(X)
+  y_mean  <- mean(y); y_c <- y - y_mean
+  col_norm_sq <- colSums(X_std^2)
+  beta <- rep(0, p)
+  for (iter in 1:max_iter) {
+    beta_old <- beta
+    for (j in 1:p) {
+      r_j <- y_c - X_std[, -j, drop = FALSE] %*% beta[-j]
+      z_j <- sum(X_std[, j] * r_j) / n
+      beta[j] <- soft_threshold(z_j, lambda) / (col_norm_sq[j] / n)
+    }
+    if (max(abs(beta - beta_old)) < tol) break
+  }
+  beta_orig <- beta / X_sds
+  intercept <- y_mean - sum(X_means * beta_orig)
+  list(intercept = intercept, beta = beta_orig, iterations = iter)
+}
+
+# Load Peru dataset (tab/space delimited, with header)
+peru <- read.table("peru.txt", header = TRUE)
+head(peru)
+
+# Compute the missing Fraclife variable = Years / Age
+peru$Fraclife <- peru$Years / peru$Age
+
+# Response: systolic blood pressure
+y <- peru$Systol
+
+# Predictors X1..X9 in the homework's order
+X <- as.matrix(peru[, c("Age", "Years", "Fraclife", "Weight", "Height",
+                         "Chin", "Forearm", "Calf", "Pulse")])
+library(glmnet)
+set.seed(42)
+cv_fit      <- cv.glmnet(X, y, alpha = 1, nfolds = 10)
+lambda_best <- cv_fit$lambda.min
+
+fit <- lasso_cd(X, y, lambda = lambda_best)
+
+pred_names <- c("Age", "Years", "Fraclife", "Weight", "Height",
+                "Chin", "Forearm", "Calf", "Pulse")
+data.frame(
+  Variable    = c("Intercept", pred_names),
+  Coefficient = round(c(fit$intercept, fit$beta), 4)
+)
+```
+**Interpretation.** The lasso retains all nine predictors at the
+CV-selected $\lambda$, but the magnitudes reveal a clear ordering
+of importance. **Fraction of urban life** ($-92.84$) is by far the
+strongest predictor, indicating that individuals who spent a larger
+fraction of their life at lower altitude have substantially lower
+systolic blood pressure — consistent with cardiovascular adaptation
+to the altitude transition. **Weight** ($+1.44$) and **Years** in
+urban area ($+1.86$) enter with the expected positive signs: heavier
+subjects and those with longer urban exposure tend toward higher SBP.
+**Age** ($-0.90$) is modestly negative, likely reflecting the narrow
+age range in this sample rather than a true aging effect. The
+skinfold measurements (Chin, Forearm, Calf) and Pulse contribute
+only minor adjustments, and Height is effectively shrunk to zero
+($-0.03$). The fact that no coefficient is driven exactly to zero
+suggests the CV-selected $\lambda$ is relatively small, favoring
+predictive accuracy over aggressive sparsity on this $n=39$ dataset.
 
 ## Problem 2
 
@@ -112,7 +208,7 @@ Methods are scored by weighted MSE with $w(\theta)=1/(\theta+0.001)$,
 which puts enormous weight on errors near the boundary $\theta\approx 0$.
 
 
-#### Part 1 — Maximum Likelihood Estimation
+### (1) Maximum Likelihood Estimation
 
 **Log-likelihood.** For $\mathbf x=(x_1,\dots,x_k)$,
 $$
@@ -140,7 +236,7 @@ theta_mle <- sapply(Z_test, mle_theta)
 summary(theta_mle)
 ```
 
-#### Part 2 — Neural Bayes Estimator
+### (2) Neural Bayes Estimator
 
 **Training data simulation.** For each simulated $\theta$, we draw $k=50$
 observations from $f(\cdot;\theta)$ using Michael–Schucany–Haas sampling
@@ -339,7 +435,7 @@ The ensemble NBE has median $0.0103$ and mean $0.320$, noticeably more
 aggressive at the boundary than the MLE (quartiles $\approx 20\times$
 smaller) while still tracking the upper range.
 
-#### Part 3 — MCMC
+### (3) MCMC
 
 We run a random-walk Metropolis–Hastings sampler with log-scale proposals
 $\log\theta^\star = \log\theta^{(t)}+\epsilon,\,\epsilon\sim N(0,\sigma^2)$,
@@ -466,7 +562,7 @@ write.csv(data.frame(MLE = theta_mle, NBE = theta_nbe, MCMC = theta_mcmc),
 ```
 
 
-#### Uncertainty Quantification for Test Dataset 1
+### (4) Uncertainty Quantification for Test Dataset 1
 
 **MCMC uncertainty** is reported as the posterior mean, 95% credible
 interval, and posterior standard deviation from the chain above.
@@ -583,7 +679,7 @@ abline(v = theta_hat_1, col = "red", lwd = 2)
 abline(v = nbe_ci, col = "darkblue", lty = 2, lwd = 2)
 ```
 
-#### Comparison and Discussion
+### Comparison and Discussion
 
 | Method | Dataset 1 point est. | 95% interval | SD |
 |---|---|---|---|
